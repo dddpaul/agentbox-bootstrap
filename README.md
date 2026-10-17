@@ -20,11 +20,14 @@ it from there - by hand or with a configuration tool such as Ansible.
 ## Usage
 
 Download a tagged release rather than `main`, so the script you run is the one
-you reviewed:
+you reviewed. The first line makes Windows PowerShell 5.1 offer TLS 1.2, which
+GitHub requires and which older Windows 10 setups do not enable by default (the
+script does the same for its own downloads):
 
 ```powershell
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 Invoke-WebRequest -UseBasicParsing -OutFile bootstrap.ps1 `
-    https://raw.githubusercontent.com/dddpaul/agentbox-bootstrap/v1.0.0/bootstrap.ps1
+    https://raw.githubusercontent.com/dddpaul/agentbox-bootstrap/v1.0.1/bootstrap.ps1
 (Get-FileHash .\bootstrap.ps1 -Algorithm SHA256).Hash   # compare with the hash you expect
 
 powershell -NoProfile -ExecutionPolicy Bypass -File .\bootstrap.ps1 `
@@ -146,8 +149,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\bootstrap.ps1 -UserName <u
 ## Re-pinning the rootfs
 
 The default image is the dated Ubuntu release
-`https://cloud-images.ubuntu.com/wsl/releases/24.04/20240423/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz`
-- a dated directory rather than `current/`, so the pin does not move under you.
+`https://cloud-images.ubuntu.com/wsl/releases/24.04/20240423/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz`,
+a dated directory rather than `current/`, so the pin does not move under you.
 To move to a newer image, pick the release directory, read its `SHA256SUMS`, and
 update both `-RootfsUrl` and `-RootfsSha256` defaults in the script (or pass
 them on the command line for a one-off).

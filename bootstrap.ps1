@@ -124,6 +124,11 @@ $ErrorActionPreference = 'Stop'
 $InformationPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
+# Windows PowerShell 5.1 on Windows 10 can still default to TLS 1.0/1.1, which
+# cloud-images.ubuntu.com and GitHub refuse, so the rootfs download would fail.
+# Add TLS 1.2 to what the host already allows instead of replacing the list.
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
 # Ask wsl.exe for UTF-8 output; without it every wsl.exe pipe is UTF-16LE and
 # string matching silently fails.
 $env:WSL_UTF8 = '1'
