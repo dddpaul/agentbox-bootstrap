@@ -124,10 +124,14 @@ $ErrorActionPreference = 'Stop'
 $InformationPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
-# Windows PowerShell 5.1 on Windows 10 can still default to TLS 1.0/1.1, which
-# cloud-images.ubuntu.com and GitHub refuse, so the rootfs download would fail.
-# Add TLS 1.2 to what the host already allows instead of replacing the list.
-[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+# Windows PowerShell 5.1 on Windows 10 can still default to an explicit
+# Ssl3/Tls list without TLS 1.2, which cloud-images.ubuntu.com and GitHub
+# refuse, so the rootfs download would fail. Add TLS 1.2 to such a list. Leave
+# SystemDefault alone: there the OS picks the protocols, and OR-ing Tls12 into
+# its zero value would pin the process to TLS 1.2 and drop TLS 1.3.
+if ([Net.ServicePointManager]::SecurityProtocol -ne [Net.SecurityProtocolType]::SystemDefault) {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+}
 
 # Ask wsl.exe for UTF-8 output; without it every wsl.exe pipe is UTF-16LE and
 # string matching silently fails.
@@ -717,8 +721,12 @@ function Invoke-ProvisionPass {
         [Parameter(Mandatory = $true)][string]$WindowsScriptPath
     )
 
-    $linuxPath = (Invoke-Wsl -Arguments @('-d', $Name, '--', 'wslpath', '-a', $WindowsScriptPath)).Trim()
-    $output = Invoke-Wsl -Arguments @('-d', $Name, '-u', 'root', '--', 'bash', $linuxPath)
+    # --exec, not --: "wsl.exe -- <cmd>" hands the command line to the distro's
+    # shell, which eats the backslashes of a Windows path (wslpath then sees
+    # C:UsersAppData...) and would split a Linux path that holds a space.
+    # --exec runs the program directly with its arguments untouched.
+    $linuxPath = (Invoke-Wsl -Arguments @('-d', $Name, '--exec', 'wslpath', '-a', $WindowsScriptPath)).Trim()
+    $output = Invoke-Wsl -Arguments @('-d', $Name, '-u', 'root', '--exec', 'bash', $linuxPath)
 
     $result = Read-ProvisionResult -Output $output
     foreach ($line in $result.Lines) { Write-Line "    $line" }

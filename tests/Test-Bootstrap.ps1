@@ -239,6 +239,13 @@ Test-Case 'provision script names the sudoers drop-in after the user' {
     Assert-True ($text -match 'sudoers_file="/etc/sudoers.d/90-\$user"') 'sudoers drop-in should be named after the user'
 }
 
+Test-Case 'the provisioner runs wslpath and bash via --exec, not through a shell' {
+    $body = (Get-Command Invoke-ProvisionPass).ScriptBlock.ToString()
+    Assert-True ($body -match "'--exec', 'wslpath'") 'wslpath must run via --exec, or the shell eats the backslashes of the Windows path'
+    Assert-True ($body -match "'--exec', 'bash'") 'the provisioner must run via --exec, or a Linux path with a space is split'
+    Assert-True ($body -notmatch "'--', '") 'no wsl.exe call in Invoke-ProvisionPass may go through "--" (the shell)'
+}
+
 Test-Case 'provision script is valid bash' {
     if (-not (Get-Command bash -ErrorAction SilentlyContinue)) {
         Write-Information '      (skipped: bash is not available)'
