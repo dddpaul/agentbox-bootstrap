@@ -246,6 +246,166 @@ Test-Case 'the provisioner runs wslpath and bash via --exec, not through a shell
     Assert-True ($body -notmatch "'--', '") 'no wsl.exe call in Invoke-ProvisionPass may go through "--" (the shell)'
 }
 
+Test-Case '.wslconfig: a missing file gets [general] instanceIdleTimeout=-1' {
+    $merge = Merge-WslConfigText -Text $null -Section 'general' -Key 'instanceIdleTimeout' -Value '-1'
+    Assert-True $merge.Changed 'an empty file must be reported as changed'
+    Assert-Equal "[general]`r`ninstanceIdleTimeout=-1`r`n" $merge.Text 'wrong text for a new file'
+}
+
+Test-Case '.wslconfig: a file without [general] keeps its sections and gains one' {
+    $text = "[wsl2]`r`nmemory=8GB`r`nswap=0`r`n"
+    $merge = Merge-WslConfigText -Text $text -Section 'general' -Key 'instanceIdleTimeout' -Value '-1'
+    Assert-True $merge.Changed 'the file must be reported as changed'
+    Assert-Equal "[wsl2]`r`nmemory=8GB`r`nswap=0`r`n`r`n[general]`r`ninstanceIdleTimeout=-1`r`n" $merge.Text 'wrong merged text'
+}
+
+Test-Case '.wslconfig: [general] with another key keeps that key and the next section' {
+    $text = "# box settings`n[general]`nguiApplications=false`n`n[wsl2]`nmemory=8GB`n"
+    $merge = Merge-WslConfigText -Text $text -Section 'general' -Key 'instanceIdleTimeout' -Value '-1'
+    Assert-True $merge.Changed 'the file must be reported as changed'
+    Assert-Equal "# box settings`n[general]`ninstanceIdleTimeout=-1`nguiApplications=false`n`n[wsl2]`nmemory=8GB`n" $merge.Text 'wrong merged text (LF endings must be kept)'
+}
+
+Test-Case '.wslconfig: another value of the key is replaced in place, whatever its case' {
+    $text = "[General]`r`ninstanceidletimeout = 15000`r`n[wsl2]`r`ninstanceIdleTimeout=7`r`n"
+    $merge = Merge-WslConfigText -Text $text -Section 'general' -Key 'instanceIdleTimeout' -Value '-1'
+    Assert-True $merge.Changed 'the file must be reported as changed'
+    Assert-Equal "[General]`r`ninstanceIdleTimeout=-1`r`n[wsl2]`r`ninstanceIdleTimeout=7`r`n" $merge.Text 'only the [general] key may change'
+}
+
+Test-Case '.wslconfig: a value already -1 leaves the text alone' {
+    $text = "[wsl2]`r`nmemory=8GB`r`n[general]`r`ninstanceIdleTimeout=-1`r`n"
+    $merge = Merge-WslConfigText -Text $text -Section 'general' -Key 'instanceIdleTimeout' -Value '-1'
+    Assert-True (-not $merge.Changed) 'an already set value must not be reported as changed'
+    Assert-Equal $text $merge.Text 'the text must be unchanged'
+}
+
+Test-Case '.wslconfig file: written when missing, then reported [ok] on a re-run' {
+    $dir = Join-Path ([IO.Path]::GetTempPath()) ("wslconfig-test-" + [guid]::NewGuid())
+    New-Item -ItemType Directory -Path $dir | Out-Null
+    $path = Join-Path $dir '.wslconfig'
+    $savedCount = $script:ChangeCount
+    try {
+        Assert-True (Set-WslIdleTimeout -Path $path) 'the first run must change the file'
+        Assert-Equal "[general]`r`ninstanceIdleTimeout=-1`r`n" ([IO.File]::ReadAllText($path)) 'wrong file content'
+        Assert-True (-not (Set-WslIdleTimeout -Path $path)) 'the second run must report [ok]'
+        Assert-Equal ($savedCount + 1) $script:ChangeCount 'exactly one change must be counted'
+
+        [IO.File]::WriteAllText($path, "[wsl2]`nmemory=4GB`n")
+        Assert-True (Set-WslIdleTimeout -Path $path) 'a file without the key must change'
+        Assert-Equal "[wsl2]`nmemory=4GB`n`n[general]`ninstanceIdleTimeout=-1`n" ([IO.File]::ReadAllText($path)) 'other keys must survive'
+    }
+    finally {
+        $script:ChangeCount = $savedCount
+        Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Stand-ins for the ScheduledTasks cmdlets, which exist only on Windows: they
+# build trigger objects shaped like the CIM instances Task Scheduler returns
+# and record what Register-ScheduledTask receives.
+function New-FakeTrigger {
+    param([string]$Class, [string]$Interval, [string]$Duration)
+
+    return [pscustomobject]@{
+        CimClass   = [pscustomobject]@{ CimClassName = $Class }
+        Delay      = $null
+        Repetition = [pscustomobject]@{ Interval = $Interval; Duration = $Duration }
+    }
+}
+
+function New-ScheduledTaskTrigger {
+    param([switch]$AtStartup, [switch]$AtLogOn, [string]$User, [switch]$Once, $At, [TimeSpan]$RepetitionInterval)
+
+    if ($AtStartup) { return New-FakeTrigger -Class 'MSFT_TaskBootTrigger' }
+    if ($AtLogOn) { return New-FakeTrigger -Class 'MSFT_TaskLogonTrigger' }
+    return New-FakeTrigger -Class 'MSFT_TaskTimeTrigger' -Interval ('PT{0}M' -f $RepetitionInterval.TotalMinutes)
+}
+
+function New-ScheduledTaskAction { param($Execute, $Argument) [pscustomobject]@{ Arguments = $Argument } }
+function New-ScheduledTaskPrincipal { param($UserId, $LogonType, $RunLevel) [pscustomobject]@{ UserId = $UserId } }
+function New-ScheduledTaskSettingsSet {
+    param([switch]$AllowStartIfOnBatteries, [switch]$DontStopIfGoingOnBatteries, [switch]$StartWhenAvailable,
+        $ExecutionTimeLimit, [string]$MultipleInstances)
+    [pscustomobject]@{ MultipleInstances = $MultipleInstances }
+}
+function Get-ScheduledTask { param($TaskName, $ErrorAction) $script:FakeTask }
+function Register-ScheduledTask {
+    param($TaskName, $Action, $Principal, $Trigger, $Settings, [switch]$Force)
+    $script:Registered = [pscustomobject]@{ Action = $Action; Principal = $Principal; Trigger = @($Trigger); Settings = $Settings }
+}
+
+function Invoke-FakeBootTaskInstall {
+    <# Runs Install-BootTask against the stubs; returns the change count it added. #>
+    param($ExistingTask)
+
+    # A fixed root: the action arguments embed it and must match across calls.
+    $root = Join-Path ([IO.Path]::GetTempPath()) 'boot-task-test'
+    New-Item -ItemType Directory -Force -Path $root | Out-Null
+    $source = Join-Path $root 'bootstrap.ps1'
+    Set-Content -LiteralPath $source -Value '# copy'
+    $script:FakeTask = $ExistingTask
+    $script:Registered = $null
+    $savedCount = $script:ChangeCount
+    try {
+        Install-BootTask -Name 'agentbox-boot' -Root $root -SourcePath $source -Distro 'agentbox' `
+            -DistroRoot 'C:\wsl' -Port 2222
+        return $script:ChangeCount - $savedCount
+    }
+    finally {
+        $script:ChangeCount = $savedCount
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function New-FakeExistingTask {
+    <# A registered task whose action and principal match, built from what a fresh install registered. #>
+    param([object[]]$Trigger)
+
+    return [pscustomobject]@{
+        Actions   = @($script:Registered.Action)
+        Principal = $script:Registered.Principal
+        Triggers  = $Trigger
+    }
+}
+
+Test-Case 'boot task is registered with boot, logon and a 5-minute indefinite repeat, IgnoreNew' {
+    Assert-Equal 1 (Invoke-FakeBootTaskInstall -ExistingTask $null) 'a fresh install must count one change'
+    Assert-True ($null -ne $script:Registered) 'Register-ScheduledTask was not called'
+    $classes = @($script:Registered.Trigger | ForEach-Object { $_.CimClass.CimClassName })
+    Assert-Equal 'MSFT_TaskBootTrigger,MSFT_TaskLogonTrigger,MSFT_TaskTimeTrigger' ($classes -join ',') 'wrong triggers'
+    Assert-Equal 'PT30S' $script:Registered.Trigger[0].Delay 'the boot trigger lost its delay'
+    Assert-Equal 'PT5M' $script:Registered.Trigger[2].Repetition.Interval 'wrong repetition interval'
+    Assert-True (-not $script:Registered.Trigger[2].Repetition.Duration) 'the repetition must have no duration (indefinitely)'
+    Assert-Equal 'IgnoreNew' $script:Registered.Settings.MultipleInstances 'wrong MultipleInstances'
+    Assert-True (Test-BootTaskTrigger -Trigger $script:Registered.Trigger -IntervalMinutes 5) 'the registered triggers must pass the existing-task check'
+}
+
+Test-Case 'boot task with only boot and logon triggers is re-registered with all three' {
+    Invoke-FakeBootTaskInstall -ExistingTask $null | Out-Null
+    $old = New-FakeExistingTask -Trigger @(
+        (New-FakeTrigger -Class 'MSFT_TaskBootTrigger'), (New-FakeTrigger -Class 'MSFT_TaskLogonTrigger'))
+    Assert-Equal 1 (Invoke-FakeBootTaskInstall -ExistingTask $old) 'a v1.0.2 task must be reported [changed]'
+    Assert-True ($null -ne $script:Registered) 'the v1.0.2 task was not re-registered'
+    Assert-Equal 3 @($script:Registered.Trigger).Count 'the re-registered task must carry three triggers'
+}
+
+Test-Case 'boot task with all three triggers is left alone' {
+    Invoke-FakeBootTaskInstall -ExistingTask $null | Out-Null
+    $current = New-FakeExistingTask -Trigger $script:Registered.Trigger
+    Assert-Equal 0 (Invoke-FakeBootTaskInstall -ExistingTask $current) 'a current task must be reported [ok]'
+    Assert-True ($null -eq $script:Registered) 'a current task must not be re-registered'
+}
+
+Test-Case 'boot task trigger check rejects a wrong interval or a finite repetition' {
+    $boot = New-FakeTrigger -Class 'MSFT_TaskBootTrigger'
+    $logon = New-FakeTrigger -Class 'MSFT_TaskLogonTrigger'
+    Assert-True (-not (Test-BootTaskTrigger -Trigger @($boot, $logon, (New-FakeTrigger -Class 'MSFT_TaskTimeTrigger' -Interval 'PT10M')) -IntervalMinutes 5)) 'a 10-minute repeat must not pass'
+    Assert-True (-not (Test-BootTaskTrigger -Trigger @($boot, $logon, (New-FakeTrigger -Class 'MSFT_TaskTimeTrigger' -Interval 'PT5M' -Duration 'P1D')) -IntervalMinutes 5)) 'a one-day repetition must not pass'
+    Assert-True (-not (Test-BootTaskTrigger -Trigger @($boot, $logon, $logon) -IntervalMinutes 5)) 'a missing repeat must not pass'
+    Assert-True (-not (Test-BootTaskTrigger -Trigger @() -IntervalMinutes 5)) 'no triggers must not pass'
+}
+
 Test-Case 'provision script is valid bash' {
     if (-not (Get-Command bash -ErrorAction SilentlyContinue)) {
         Write-Information '      (skipped: bash is not available)'

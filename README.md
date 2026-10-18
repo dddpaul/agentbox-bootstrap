@@ -58,6 +58,25 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\bootstrap.ps1 `
    script runs `wsl --update` whenever `wsl --version` reports less than
    **0.67.6**, and stops with a pointer to <https://aka.ms/wsl2kernel> if the
    host still reports an older runtime afterwards.
+
+   It then makes sure `%UserProfile%\.wslconfig` holds:
+
+   ```ini
+   [general]
+   instanceIdleTimeout=-1
+   ```
+
+   By default WSL stops a distro 15 s after the last `wsl.exe` attached to it
+   exits, which would take sshd down with it. The key is merged into the
+   file: other sections and keys stay as they are, and a file that already
+   says `-1` is reported `[ok]`. `.wslconfig` belongs to the Windows user, so
+   the setting keeps **every** WSL distro of that user running, not just this
+   one - fine for a dedicated box, worth knowing on a shared one.
+
+   A changed `.wslconfig` only takes effect once WSL restarts, so when the
+   script has to write it, it runs `wsl --shutdown` right away - before the
+   import and provisioning - which stops every running distro of the user. A
+   re-run that finds the setting in place shuts nothing down.
 3. Downloads the pinned Ubuntu 24.04 rootfs into `<WslRoot>\cache`, verifies its
    SHA256 and imports it with `wsl --import <DistroName> <WslRoot>\<DistroName>`.
    A tarball that does not match the pin is refused, never imported.
@@ -85,7 +104,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\bootstrap.ps1 `
 5. Adds `netsh interface portproxy` `:<SshPort> -> <wsl-ip>:22` and an inbound
    firewall rule `<DistroName> sshd (TCP <SshPort>)`.
 6. Copies itself to `<InstallRoot>\bootstrap.ps1` and registers the
-   `<TaskName>` scheduled task, which re-runs it in `BootRefresh` mode.
+   `<TaskName>` scheduled task, which re-runs it in `BootRefresh` mode. A task
+   left by an older version without the 5-minute trigger is re-registered.
 
 ## Idempotence
 
@@ -110,14 +130,23 @@ missing, and a cached tarball that still matches the checksum is reused.
 WSL2 on Windows 10 is NAT-only - mirrored networking is a Windows 11 feature -
 so the distro gets a **new IP every time it starts** and a static portproxy
 would point at nothing after a reboot. The scheduled task therefore runs
-`bootstrap.ps1 -Mode BootRefresh` at startup (30 s delay) and at logon: it
-starts the distro, makes sure `ssh` is up, reads the current address and
-rewrites the portproxy only when it drifted.
+`bootstrap.ps1 -Mode BootRefresh` at startup (30 s delay), at logon and every
+5 minutes, indefinitely: it starts the distro, makes sure `ssh` is up, reads
+the current address and rewrites the portproxy only when it drifted.
+
+The 5-minute repeat covers a distro that stops while Windows stays up: an
+update of WSL from Windows Update stops WSL's processes, and so do a crash and
+`wsl --shutdown`. Within 5 minutes the next run starts the distro again and
+repoints the portproxy at its new address - so a distro you stop on purpose
+comes back too; disable the task first if you need it down. On a running
+distro a repeat changes nothing. A repeat that comes due while the previous
+run is still going is skipped (`MultipleInstances IgnoreNew`).
 
 The task runs as the user that registered the distro, with the highest
 privileges and `S4U` logon - WSL distros are per-user, so a task running as
 `SYSTEM` would not see the distro at all. Its log is
-`<InstallRoot>\boot-refresh.log`.
+`<InstallRoot>\boot-refresh.log`; the repeats add a few lines every 5
+minutes, and the log is rotated to `boot-refresh.log.old` past 1 MB.
 
 Run it by hand after a suspicious boot:
 
@@ -159,7 +188,9 @@ them on the command line for a one-off).
 
 `tests/Test-Bootstrap.ps1` runs anywhere PowerShell 5.1+ is available (`pwsh`
 on Linux/macOS included): it parse-checks `bootstrap.ps1`, checks its parameter
-defaults, unit-tests the WSL-address and portproxy parsers, and `bash -n`-checks
+defaults, unit-tests the WSL-address and portproxy parsers, the `.wslconfig`
+merge and the boot task's trigger check (against stubbed ScheduledTasks
+cmdlets), and `bash -n`-checks
 the provisioning script that is generated for the distro.
 
 ```powershell

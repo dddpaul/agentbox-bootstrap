@@ -11,12 +11,14 @@
       1. enables the WSL2 Windows features and makes 2 the default WSL version,
       2. updates the WSL runtime itself, because the one that ships with those
          features has no WSL2 kernel and ignores "[boot] systemd=true",
+         and sets "[general] instanceIdleTimeout=-1" in the user's .wslconfig,
+         so WSL does not stop the distro when no wsl.exe is attached,
       3. imports a checksum-pinned Ubuntu 24.04 rootfs as the distro,
       4. provisions the login user and openssh-server inside the distro,
       5. publishes the distro's sshd on a Windows port, 2222 by default (netsh portproxy
          plus an inbound firewall rule),
       6. registers a scheduled task that starts the distro and rewrites the
-         portproxy on every boot.
+         portproxy at every boot, at logon and every 5 minutes.
 
     Step 6 exists because WSL2 on Windows 10 is NAT-only (mirrored networking is
     Windows 11 only), so the distro gets a fresh IP every time it starts and a
@@ -29,7 +31,7 @@
 .PARAMETER Mode
     Bootstrap (default) runs the full setup. BootRefresh only starts the distro
     and repoints the portproxy at its current IP; that is what the scheduled
-    task runs at boot and at logon.
+    task runs at boot, at logon and every 5 minutes.
 
 .PARAMETER DistroName
     Name of the WSL distro to import and manage. Default: ubuntu-ssh.
@@ -158,6 +160,11 @@ $script:MinimumWslVersion = [version]'0.67.6'
 $script:ProvisionChangedMarker = 'bootstrap-provision-changed='
 $script:ProvisionRestartMarker = 'bootstrap-provision-restart-required=1'
 $script:ProvisionSystemdMarker = 'bootstrap-provision-systemd-missing=1'
+
+# Minutes between the boot task's repeated BootRefresh runs, which start the
+# distro again after anything stops it while Windows stays up (a WSL update,
+# a crash, wsl --shutdown).
+$script:BootRefreshIntervalMinutes = 5
 
 #region output helpers
 
@@ -309,6 +316,101 @@ function Read-ProvisionResult {
         SystemdMissing  = $systemdMissing
         Lines           = $lines
     }
+}
+
+function Merge-WslConfigText {
+    <#
+    .SYNOPSIS
+        Sets a key in a section of .wslconfig text and reports whether the text
+        changed.
+    .DESCRIPTION
+        Every other section, key, comment and blank line is kept as it is, and
+        the line endings of the input are reused (CRLF for a new file). Section
+        and key names match case-insensitively, so an existing
+        "instanceidletimeout" is updated instead of duplicated. A key that is
+        missing from the section is added right below the section header; a
+        missing section is appended at the end.
+    #>
+    param(
+        [string]$Text,
+        [Parameter(Mandatory = $true)][string]$Section,
+        [Parameter(Mandatory = $true)][string]$Key,
+        [Parameter(Mandatory = $true)][string]$Value
+    )
+
+    if (-not $Text) { $Text = '' }
+    $newline = if ($Text -match "`r`n" -or -not $Text) { "`r`n" } else { "`n" }
+    $wanted = "$Key=$Value"
+    $lines = [Collections.Generic.List[string]]::new()
+    foreach ($line in ($Text -split "`r?`n")) { $lines.Add($line) }
+    if ($lines.Count -gt 0 -and $lines[$lines.Count - 1] -eq '') { $lines.RemoveAt($lines.Count - 1) }
+
+    $headerIndex = -1
+    $found = $false
+    $changed = $false
+    $current = $null
+    $keyPattern = '^\s*' + [regex]::Escape($Key) + '\s*=\s*(.*?)\s*$'
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $header = [regex]::Match($lines[$i], '^\s*\[([^\]]*)\]\s*$')
+        if ($header.Success) {
+            $current = $header.Groups[1].Value.Trim()
+            if ($headerIndex -lt 0 -and $current -eq $Section) { $headerIndex = $i }
+            continue
+        }
+        if ($current -ne $Section) { continue }
+
+        $entry = [regex]::Match($lines[$i], $keyPattern, 'IgnoreCase')
+        if (-not $entry.Success) { continue }
+        $found = $true
+        if ($entry.Groups[1].Value -ne $Value) {
+            $lines[$i] = $wanted
+            $changed = $true
+        }
+    }
+
+    if (-not $found) {
+        $changed = $true
+        if ($headerIndex -ge 0) {
+            $lines.Insert($headerIndex + 1, $wanted)
+        }
+        else {
+            if ($lines.Count -gt 0 -and $lines[$lines.Count - 1].Trim()) { $lines.Add('') }
+            $lines.Add("[$Section]")
+            $lines.Add($wanted)
+        }
+    }
+
+    return [pscustomobject]@{
+        Text    = ($lines -join $newline) + $newline
+        Changed = $changed
+    }
+}
+
+function Test-BootTaskTrigger {
+    <#
+    .SYNOPSIS
+        Tells whether a registered task's triggers are the boot, logon and
+        repeating triggers this script registers.
+    .DESCRIPTION
+        The repeating trigger must fire every IntervalMinutes with no
+        repetition duration - an empty duration is how Task Scheduler stores
+        "indefinitely". A task registered by v1.0.2 has only the boot and logon
+        triggers and fails this check, so a re-run re-registers it.
+    #>
+    param(
+        [object[]]$Trigger,
+        [Parameter(Mandatory = $true)][int]$IntervalMinutes
+    )
+
+    $classes = @($Trigger | Where-Object { $_ } | ForEach-Object { $_.CimClass.CimClassName })
+    if ($classes.Count -ne 3) { return $false }
+    if (@($classes | Where-Object { $_ -eq 'MSFT_TaskBootTrigger' }).Count -ne 1) { return $false }
+    if (@($classes | Where-Object { $_ -eq 'MSFT_TaskLogonTrigger' }).Count -ne 1) { return $false }
+
+    $repeat = @($Trigger | Where-Object { $_ -and $_.CimClass.CimClassName -eq 'MSFT_TaskTimeTrigger' })
+    if ($repeat.Count -ne 1 -or -not $repeat[0].Repetition) { return $false }
+
+    return ($repeat[0].Repetition.Interval -eq "PT${IntervalMinutes}M" -and -not $repeat[0].Repetition.Duration)
 }
 
 function New-ProvisionScriptText {
@@ -816,11 +918,58 @@ function Set-SshFirewallRule {
     Write-Changed "created firewall rule '$DisplayName' for TCP $Port"
 }
 
+function Set-WslIdleTimeout {
+    <#
+    .SYNOPSIS
+        Makes .wslconfig say "[general] instanceIdleTimeout=-1", so WSL does
+        not stop a distro once no wsl.exe is attached to it. Returns $true when
+        the file was changed.
+    .DESCRIPTION
+        .wslconfig belongs to the Windows user, so the setting keeps every WSL
+        distro of that user running. Other sections and keys are kept. The file
+        is written as UTF-8 without a BOM.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $text = if (Test-Path -LiteralPath $Path) { [IO.File]::ReadAllText($Path) } else { '' }
+    $merge = Merge-WslConfigText -Text $text -Section 'general' -Key 'instanceIdleTimeout' -Value '-1'
+    if (-not $merge.Changed) {
+        Write-Ok "instanceIdleTimeout=-1 already set in $Path"
+        return $false
+    }
+
+    [IO.File]::WriteAllText($Path, $merge.Text, (New-Object Text.UTF8Encoding($false)))
+    Write-Changed "set [general] instanceIdleTimeout=-1 in $Path"
+    return $true
+}
+
+function New-BootTaskTrigger {
+    <#
+    .SYNOPSIS
+        Builds the boot task's triggers: at startup (30 s delay), at logon, and
+        every BootRefreshIntervalMinutes indefinitely.
+    .DESCRIPTION
+        The repeating trigger leaves -RepetitionDuration unset: that is
+        "indefinitely", while [TimeSpan]::MaxValue is rejected as out of range
+        by Task Scheduler on Windows 10.
+    #>
+    param([Parameter(Mandatory = $true)][string]$UserId)
+
+    $startup = New-ScheduledTaskTrigger -AtStartup
+    $startup.Delay = 'PT30S'
+    $logon = New-ScheduledTaskTrigger -AtLogOn -User $UserId
+    $repeat = New-ScheduledTaskTrigger -Once -At (Get-Date).Date `
+        -RepetitionInterval (New-TimeSpan -Minutes $script:BootRefreshIntervalMinutes)
+
+    return @($startup, $logon, $repeat)
+}
+
 function Install-BootTask {
     <#
     .SYNOPSIS
         Copies this script next to its log under InstallRoot and registers the
-        scheduled task that re-runs it in BootRefresh mode.
+        scheduled task that re-runs it in BootRefresh mode at boot, at logon
+        and every BootRefreshIntervalMinutes.
     .DESCRIPTION
         The installed copy makes the task independent of where the repository is
         checked out. The task runs as the user that registered the distro,
@@ -860,22 +1009,23 @@ function Install-BootTask {
     $existing = Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
     if ($existing -and @($existing.Actions).Count -eq 1 -and
         $existing.Actions[0].Arguments -eq $argument -and
-        $existing.Principal.UserId -eq $userId) {
+        $existing.Principal.UserId -eq $userId -and
+        (Test-BootTaskTrigger -Trigger @($existing.Triggers) -IntervalMinutes $script:BootRefreshIntervalMinutes)) {
         Write-Ok "scheduled task '$Name' already registered"
         return
     }
 
-    $startup = New-ScheduledTaskTrigger -AtStartup
-    $startup.Delay = 'PT30S'
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argument
     $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType S4U -RunLevel Highest
+    # IgnoreNew: a repeat that comes due while a slow BootRefresh still runs is
+    # skipped instead of starting a second copy.
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-        -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
+        -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 15) -MultipleInstances IgnoreNew
 
     Register-ScheduledTask -TaskName $Name -Action $action -Principal $principal `
-        -Trigger @($startup, (New-ScheduledTaskTrigger -AtLogOn -User $userId)) `
-        -Settings $settings -Force | Out-Null
-    Write-Changed "registered scheduled task '$Name' (boot + logon) as $userId"
+        -Trigger (New-BootTaskTrigger -UserId $userId) -Settings $settings -Force | Out-Null
+    Write-Changed ("registered scheduled task '{0}' (boot + logon + every {1} min) as {2}" -f `
+            $Name, $script:BootRefreshIntervalMinutes, $userId)
 }
 
 function Invoke-BootRefresh {
@@ -917,6 +1067,15 @@ function Invoke-Bootstrap {
     Write-Step 'Checking the WSL runtime'
     Update-WslRuntime
     Set-WslDefaultVersion -Version 2
+
+    # A changed .wslconfig only applies once WSL restarts. Shut WSL down now,
+    # before the distro is imported and provisioned, so the rest of the run and
+    # the box afterwards use the new setting without a reboot.
+    Write-Step 'Keeping WSL distros running when no wsl.exe is attached'
+    if (Set-WslIdleTimeout -Path (Join-Path $env:USERPROFILE '.wslconfig')) {
+        Invoke-Wsl -Arguments @('--shutdown') | Out-Null
+        Write-Changed 'stopped every WSL distro of this user (wsl --shutdown) to apply .wslconfig'
+    }
 
     Write-Step "Importing distro $DistroName"
     $wslDrive = [IO.Path]::GetPathRoot($WslRoot)
