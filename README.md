@@ -22,12 +22,13 @@ it from there - by hand or with a configuration tool such as Ansible.
 Download a tagged release rather than `main`, so the script you run is the one
 you reviewed. The first line makes Windows PowerShell 5.1 offer TLS 1.2, which
 GitHub requires and which older Windows 10 setups do not enable by default (the
-script does the same for its own downloads):
+script adds TLS 1.2 for its own downloads too, but leaves a SystemDefault
+setting alone so the OS can still pick TLS 1.3):
 
 ```powershell
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 Invoke-WebRequest -UseBasicParsing -OutFile bootstrap.ps1 `
-    https://raw.githubusercontent.com/dddpaul/agentbox-bootstrap/v1.0.4/bootstrap.ps1
+    https://raw.githubusercontent.com/dddpaul/agentbox-bootstrap/v1.0.5/bootstrap.ps1
 (Get-FileHash .\bootstrap.ps1 -Algorithm SHA256).Hash   # compare with the hash you expect
 
 powershell -NoProfile -ExecutionPolicy Bypass -File .\bootstrap.ps1 `

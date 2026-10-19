@@ -130,8 +130,11 @@ $ProgressPreference = 'SilentlyContinue'
 # Ssl3/Tls list without TLS 1.2, which cloud-images.ubuntu.com and GitHub
 # refuse, so the rootfs download would fail. Add TLS 1.2 to such a list. Leave
 # SystemDefault alone: there the OS picks the protocols, and OR-ing Tls12 into
-# its zero value would pin the process to TLS 1.2 and drop TLS 1.3.
-if ([Net.ServicePointManager]::SecurityProtocol -ne [Net.SecurityProtocolType]::SystemDefault) {
+# its zero value would pin the process to TLS 1.2 and drop TLS 1.3. Compare
+# with 0, not the SystemDefault member: that member exists only from .NET
+# Framework 4.7, and under strict mode an older host would stop here with an
+# unclear error before the Windows build check.
+if ([int][Net.ServicePointManager]::SecurityProtocol -ne 0) {
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 }
 
@@ -825,7 +828,7 @@ function Invoke-ProvisionPass {
 
     # --exec, not --: "wsl.exe -- <cmd>" hands the command line to the distro's
     # shell, which eats the backslashes of a Windows path (wslpath then sees
-    # C:UsersAppData...) and would split a Linux path that holds a space.
+    # C:UsersaliceAppData...) and would split a Linux path that holds a space.
     # --exec runs the program directly with its arguments untouched.
     $linuxPath = (Invoke-Wsl -Arguments @('-d', $Name, '--exec', 'wslpath', '-a', $WindowsScriptPath)).Trim()
     $output = Invoke-Wsl -Arguments @('-d', $Name, '-u', 'root', '--exec', 'bash', $linuxPath)

@@ -240,10 +240,24 @@ Test-Case 'provision script names the sudoers drop-in after the user' {
 }
 
 Test-Case 'the provisioner runs wslpath and bash via --exec, not through a shell' {
-    $body = (Get-Command Invoke-ProvisionPass).ScriptBlock.ToString()
-    Assert-True ($body -match "'--exec', 'wslpath'") 'wslpath must run via --exec, or the shell eats the backslashes of the Windows path'
-    Assert-True ($body -match "'--exec', 'bash'") 'the provisioner must run via --exec, or a Linux path with a space is split'
-    Assert-True ($body -notmatch "'--', '") 'no wsl.exe call in Invoke-ProvisionPass may go through "--" (the shell)'
+    # A stand-in for Invoke-Wsl, visible to Invoke-ProvisionPass while this
+    # case runs: it records each argument array and answers like wsl.exe.
+    $calls = [Collections.Generic.List[object]]::new()
+    function Invoke-Wsl {
+        param([string[]]$Arguments, [switch]$IgnoreExitCode)
+        $calls.Add($Arguments)
+        if ($Arguments -contains 'wslpath') { return "/mnt/c/Users/alice/My Files/provision.sh`n" }
+        return 'bootstrap-provision-changed=0'
+    }
+
+    $windowsPath = 'C:\Users\alice\My Files\provision.sh'
+    Invoke-ProvisionPass -Name 'agentbox' -WindowsScriptPath $windowsPath | Out-Null
+
+    Assert-Equal 2 $calls.Count 'Invoke-ProvisionPass should call wsl.exe twice'
+    Assert-Equal ('-d|agentbox|--exec|wslpath|-a|' + $windowsPath) ($calls[0] -join '|') `
+        'wslpath must run via --exec, or the shell eats the backslashes of the Windows path'
+    Assert-Equal '-d|agentbox|-u|root|--exec|bash|/mnt/c/Users/alice/My Files/provision.sh' ($calls[1] -join '|') `
+        'the provisioner must run via --exec with the Linux path as one argument, or a path with a space is split'
 }
 
 Test-Case '.wslconfig: a missing file gets [general] instanceIdleTimeout=-1' {
