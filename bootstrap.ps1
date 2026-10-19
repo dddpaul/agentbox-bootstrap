@@ -226,6 +226,30 @@ function Get-IPv4FromWslOutput {
     return $null
 }
 
+function Get-LinuxPathFromWslOutput {
+    <#
+    .SYNOPSIS
+        Extracts the Linux path from "wslpath -a" output.
+    .DESCRIPTION
+        wsl.exe can print a line of its own before the command's output: on a
+        distro's first boot, and right after a restart, it warns "wsl: Failed to
+        start the systemd user session for '<user>'". Taking the whole output as
+        the path hands bash a file name that does not exist, so the path is the
+        last line that starts with a slash. Returns $null when there is none.
+    #>
+    param([string]$Text)
+
+    if (-not $Text) { return $null }
+
+    $paths = @(foreach ($line in ($Text -split "`r?`n")) {
+            $trimmed = $line.Trim()
+            if ($trimmed.StartsWith('/')) { $trimmed }
+        })
+    if ($paths.Count -eq 0) { return $null }
+
+    return $paths[-1]
+}
+
 function Get-WslRuntimeVersion {
     <#
     .SYNOPSIS
@@ -830,7 +854,11 @@ function Invoke-ProvisionPass {
     # shell, which eats the backslashes of a Windows path (wslpath then sees
     # C:UsersaliceAppData...) and would split a Linux path that holds a space.
     # --exec runs the program directly with its arguments untouched.
-    $linuxPath = (Invoke-Wsl -Arguments @('-d', $Name, '--exec', 'wslpath', '-a', $WindowsScriptPath)).Trim()
+    $wslpathOutput = Invoke-Wsl -Arguments @('-d', $Name, '--exec', 'wslpath', '-a', $WindowsScriptPath)
+    $linuxPath = Get-LinuxPathFromWslOutput -Text $wslpathOutput
+    if (-not $linuxPath) {
+        throw "wslpath printed no Linux path for ${WindowsScriptPath}: $wslpathOutput"
+    }
     $output = Invoke-Wsl -Arguments @('-d', $Name, '-u', 'root', '--exec', 'bash', $linuxPath)
 
     $result = Read-ProvisionResult -Output $output

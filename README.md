@@ -28,7 +28,7 @@ setting alone so the OS can still pick TLS 1.3):
 ```powershell
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 Invoke-WebRequest -UseBasicParsing -OutFile bootstrap.ps1 `
-    https://raw.githubusercontent.com/dddpaul/agentbox-bootstrap/v1.0.5/bootstrap.ps1
+    https://raw.githubusercontent.com/dddpaul/agentbox-bootstrap/v1.0.6/bootstrap.ps1
 (Get-FileHash .\bootstrap.ps1 -Algorithm SHA256).Hash   # compare with the hash you expect
 
 powershell -NoProfile -ExecutionPolicy Bypass -File .\bootstrap.ps1 `

@@ -78,6 +78,17 @@ Test-Case 'WSL IPv4 skips a quad with an out-of-range octet' {
     Assert-Equal '10.0.0.4' (Get-IPv4FromWslOutput -Text "inet 300.1.1.1/20`ninet 10.0.0.4/20") 'should fall through to the valid quad'
 }
 
+Test-Case 'wslpath output: the Linux path is the last line that starts with a slash' {
+    $warning = "wsl: Failed to start the systemd user session for 'root'. See journalctl for more details."
+    Assert-Equal '/mnt/c/Users/alice/p.sh' (Get-LinuxPathFromWslOutput -Text "/mnt/c/Users/alice/p.sh`n") 'plain output'
+    Assert-Equal '/mnt/c/Users/alice/p.sh' (Get-LinuxPathFromWslOutput -Text "$warning`r`n/mnt/c/Users/alice/p.sh`r`n") `
+        'a first-boot systemd warning before the path must be skipped'
+    Assert-Equal '/mnt/c/Users/alice/My Files/p.sh' (Get-LinuxPathFromWslOutput -Text "$warning`n  /mnt/c/Users/alice/My Files/p.sh  ") `
+        'a path with a space survives, surrounding blanks do not'
+    Assert-True ($null -eq (Get-LinuxPathFromWslOutput -Text '')) 'empty output should give $null'
+    Assert-True ($null -eq (Get-LinuxPathFromWslOutput -Text $warning)) 'a warning alone is not a path'
+}
+
 Test-Case 'WSL runtime version is read from "wsl --version"' {
     Assert-Equal ([version]'2.0.9.0') (Get-WslRuntimeVersion -Text "WSL version: 2.0.9.0`nKernel version: 5.15.133.1-1") 'wrong version'
     Assert-True ($null -eq (Get-WslRuntimeVersion -Text '')) 'the inbox runtime prints no version'
@@ -258,6 +269,37 @@ Test-Case 'the provisioner runs wslpath and bash via --exec, not through a shell
         'wslpath must run via --exec, or the shell eats the backslashes of the Windows path'
     Assert-Equal '-d|agentbox|-u|root|--exec|bash|/mnt/c/Users/alice/My Files/provision.sh' ($calls[1] -join '|') `
         'the provisioner must run via --exec with the Linux path as one argument, or a path with a space is split'
+}
+
+Test-Case 'the provisioner runs the script even when wsl.exe warns before the wslpath output' {
+    # What the box printed on a fresh distro's first boot and after the restart
+    # that applies /etc/wsl.conf: the warning, then the path.
+    $calls = [Collections.Generic.List[object]]::new()
+    function Invoke-Wsl {
+        param([string[]]$Arguments, [switch]$IgnoreExitCode)
+        $calls.Add($Arguments)
+        if ($Arguments -contains 'wslpath') {
+            return "wsl: Failed to start the systemd user session for 'alice'. See journalctl for more details.`r`n/mnt/c/Users/alice/provision.sh`r`n"
+        }
+        return 'bootstrap-provision-changed=0'
+    }
+
+    Invoke-ProvisionPass -Name 'agentbox' -WindowsScriptPath 'C:\Users\alice\provision.sh' | Out-Null
+    Assert-Equal '-d|agentbox|-u|root|--exec|bash|/mnt/c/Users/alice/provision.sh' ($calls[1] -join '|') `
+        'bash must get the path alone, not the warning glued to it'
+}
+
+Test-Case 'the provisioner stops with a clear error when wslpath prints no path' {
+    function Invoke-Wsl {
+        param([string[]]$Arguments, [switch]$IgnoreExitCode)
+        if ($Arguments -contains 'wslpath') { return "wsl: something went wrong`r`n" }
+        throw 'bash must not run without a path'
+    }
+
+    $message = $null
+    try { Invoke-ProvisionPass -Name 'agentbox' -WindowsScriptPath 'C:\Users\alice\provision.sh' | Out-Null }
+    catch { $message = $_.Exception.Message }
+    Assert-True ($message -like 'wslpath printed no Linux path for*') "unexpected error: $message"
 }
 
 Test-Case '.wslconfig: a missing file gets [general] instanceIdleTimeout=-1' {
