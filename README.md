@@ -27,7 +27,7 @@ script does the same for its own downloads):
 ```powershell
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 Invoke-WebRequest -UseBasicParsing -OutFile bootstrap.ps1 `
-    https://raw.githubusercontent.com/dddpaul/agentbox-bootstrap/v1.0.2/bootstrap.ps1
+    https://raw.githubusercontent.com/dddpaul/agentbox-bootstrap/v1.0.4/bootstrap.ps1
 (Get-FileHash .\bootstrap.ps1 -Algorithm SHA256).Hash   # compare with the hash you expect
 
 powershell -NoProfile -ExecutionPolicy Bypass -File .\bootstrap.ps1 `
